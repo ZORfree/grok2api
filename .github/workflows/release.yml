@@ -1,0 +1,415 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_call:
+    inputs:
+      version:
+        description: '版本号（例如 v1.0.0）'
+        required: false
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（留空则从 VERSION 文件读取）'
+        required: false
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  # ─────────────────────────────────────────
+  # 1. 确定版本号
+  # ─────────────────────────────────────────
+  prepare:
+    name: Prepare version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME}"
+          else
+            VERSION=$(cat VERSION | tr -d '[:space:]')
+          fi
+          # 确保以 v 开头
+          [[ "$VERSION" == v* ]] || VERSION="v${VERSION}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$VERSION"     >> "$GITHUB_OUTPUT"
+          echo "Will release as: $VERSION"
+
+  # ─────────────────────────────────────────
+  # 2. 构建前端
+  # ─────────────────────────────────────────
+  build-frontend:
+    name: Build frontend
+    needs: prepare
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.5.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        working-directory: frontend
+        run: pnpm build
+
+      - name: Upload frontend dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+          retention-days: 1
+
+  # ─────────────────────────────────────────
+  # 3. 构建后端二进制（多平台）
+  # ─────────────────────────────────────────
+  build-backend:
+    name: Build backend (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            suffix: ''
+          - goos: linux
+            goarch: arm64
+            suffix: ''
+          - goos: darwin
+            goarch: amd64
+            suffix: ''
+          - goos: darwin
+            goarch: arm64
+            suffix: ''
+          - goos: windows
+            goarch: amd64
+            suffix: '.exe'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: Build
+        working-directory: backend
+        env:
+          GOOS:   ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          mkdir -p ../dist
+          go build -buildvcs=false -trimpath \
+            -ldflags="-s -w -X main.Version=${{ needs.prepare.outputs.version }}" \
+            -o "../dist/grok2api-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}" \
+            ./cmd/grok2api
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/grok2api-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
+          retention-days: 1
+
+  # ─────────────────────────────────────────
+  # 4. 打包发布产物（二进制 + 前端 dist）
+  # ─────────────────────────────────────────
+  package:
+    name: Package release assets
+    needs:
+      - prepare
+      - build-frontend
+      - build-backend
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Prepare release directory
+        run: |
+          mkdir -p release
+          VERSION="${{ needs.prepare.outputs.version }}"
+
+          cp config.example.yaml release/
+          cp VERSION release/
+
+          for dir in artifacts/backend-*/; do
+            platform=$(basename "$dir" | sed 's/backend-//')
+            binary_file=$(ls "$dir")
+            binary_name=$(basename "$binary_file")
+            ext="${binary_name##*.}"
+            [ "$ext" = "$binary_name" ] && ext="" || ext=".$ext"
+            [ "$platform" = *"windows"* ] && ext=".exe" || true
+
+            mkdir -p "pkg_${platform}"
+            cp "${dir}${binary_name}" "pkg_${platform}/grok2api${ext}"
+            cp -r artifacts/frontend-dist "pkg_${platform}/frontend-dist"
+            cp config.example.yaml "pkg_${platform}/"
+            cp VERSION "pkg_${platform}/"
+
+            if [[ "$platform" == *"windows"* ]]; then
+              zip -r "release/grok2api-${VERSION}-${platform}.zip" "pkg_${platform}/"
+            else
+              tar -czf "release/grok2api-${VERSION}-${platform}.tar.gz" "pkg_${platform}/"
+            fi
+
+            rm -rf "pkg_${platform}"
+          done
+
+          tar -czf "release/grok2api-${VERSION}-frontend-dist.tar.gz" -C artifacts/frontend-dist .
+          ls -lh release/
+
+      - name: Upload packaged release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: release/
+          retention-days: 7
+
+  # ─────────────────────────────────────────
+  # 5. 创建 GitHub Release
+  # ─────────────────────────────────────────
+  github-release:
+    name: Create GitHub Release
+    needs:
+      - prepare
+      - package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release/
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            COMMITS=$(git log --oneline "${PREV_TAG}..HEAD" 2>/dev/null | head -50 || echo "")
+          else
+            COMMITS=$(git log --oneline -20 2>/dev/null || echo "")
+          fi
+
+          {
+            echo "## What's Changed"
+            echo ""
+            echo "> Auto-synced from [chenyme/grok2api](https://github.com/chenyme/grok2api)"
+            echo ""
+            if [ -n "$COMMITS" ]; then
+              echo "### Commits"
+              echo '```'
+              echo "$COMMITS"
+              echo '```'
+            fi
+            echo ""
+            echo "## 下载说明"
+            echo ""
+            echo "| 文件名 | 说明 |"
+            echo "|--------|------|"
+            echo "| \`grok2api-${VERSION}-linux-amd64.tar.gz\` | Linux x86_64 完整包 |"
+            echo "| \`grok2api-${VERSION}-linux-arm64.tar.gz\` | Linux ARM64 完整包 |"
+            echo "| \`grok2api-${VERSION}-darwin-amd64.tar.gz\` | macOS Intel 完整包 |"
+            echo "| \`grok2api-${VERSION}-darwin-arm64.tar.gz\` | macOS Apple Silicon 完整包 |"
+            echo "| \`grok2api-${VERSION}-windows-amd64.zip\` | Windows x86_64 完整包 |"
+            echo "| \`grok2api-${VERSION}-frontend-dist.tar.gz\` | 仅前端静态文件 |"
+            echo ""
+            echo "每个完整包包含：可执行文件、前端 dist 目录、config.example.yaml 配置示例。"
+          } > changelog.md
+
+      - name: Create or update Git tag
+        run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if ! git ls-remote --tags origin "refs/tags/${VERSION}" | grep -q "${VERSION}"; then
+            git tag -a "${VERSION}" -m "Release ${VERSION}"
+            git push origin "${VERSION}"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.version }}
+          name: Release ${{ needs.prepare.outputs.version }}
+          body_path: changelog.md
+          draft: false
+          prerelease: false
+          files: release/*
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ─────────────────────────────────────────
+  # 6. 构建并推送 Docker 镜像到 GHCR
+  # ─────────────────────────────────────────
+  docker:
+    name: Build & Push Docker image (${{ matrix.arch }})
+    needs:
+      - prepare
+      - package
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Normalize image name
+        id: image
+        shell: bash
+        run: |
+          image_name=$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          echo "name=ghcr.io/${image_name}" >> "$GITHUB_OUTPUT"
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=${{ needs.prepare.outputs.version }}-${{ matrix.arch }}
+            type=raw,value=latest-${{ matrix.arch }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ matrix.arch }},mode=max
+          provenance: mode=max
+          sbom: true
+
+  docker-merge:
+    name: Merge Docker manifest
+    needs:
+      - prepare
+      - docker
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Normalize image name
+        id: image
+        shell: bash
+        run: |
+          image_name=$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          echo "name=ghcr.io/${image_name}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifest
+        shell: bash
+        run: |
+          IMAGE="${{ steps.image.outputs.name }}"
+          VERSION="${{ needs.prepare.outputs.version }}"
+
+          docker buildx imagetools create \
+            -t "${IMAGE}:${VERSION}" \
+            "${IMAGE}:${VERSION}-amd64" \
+            "${IMAGE}:${VERSION}-arm64"
+
+          docker buildx imagetools create \
+            -t "${IMAGE}:latest" \
+            "${IMAGE}:latest-amd64" \
+            "${IMAGE}:latest-arm64"
+
+      - name: Inspect manifest
+        run: |
+          IMAGE="${{ steps.image.outputs.name }}"
+          VERSION="${{ needs.prepare.outputs.version }}"
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}"
