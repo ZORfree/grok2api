@@ -1,24 +1,10 @@
-name: Build & Release
+name: Sync & Release
 
 on:
-  push:
-    tags:
-      - 'v*.*.*'
-  workflow_call:
-    inputs:
-      version:
-        description: '版本号（例如 v1.0.0）'
-        required: false
-        type: string
   workflow_dispatch:
-    inputs:
-      version:
-        description: '版本号（留空则从 VERSION 文件读取）'
-        required: false
-        type: string
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: sync-and-release
   cancel-in-progress: false
 
 permissions:
@@ -27,33 +13,41 @@ permissions:
 
 jobs:
   # ─────────────────────────────────────────
-  # 1. 确定版本号
+  # 1. 同步上游代码 & 确定版本号
   # ─────────────────────────────────────────
-  prepare:
-    name: Prepare version
+  sync:
+    name: Sync upstream
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.ver.outputs.version }}
-      tag: ${{ steps.ver.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
 
-      - name: Resolve version
-        id: ver
+      - name: Configure Git
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            VERSION="${{ inputs.version }}"
-          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            VERSION="${GITHUB_REF_NAME}"
-          else
-            VERSION=$(cat VERSION | tr -d '[:space:]')
-          fi
-          # 确保以 v 开头
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync from upstream
+        run: |
+          git remote add upstream https://github.com/chenyme/grok2api.git
+          git fetch upstream main --tags
+          git merge upstream/main --no-edit --allow-unrelated-histories
+          git push origin main
+          git fetch upstream --tags
+          git push origin --tags --force
+
+      - name: Read VERSION
+        id: version
+        run: |
+          VERSION=$(cat VERSION | tr -d '[:space:]')
           [[ "$VERSION" == v* ]] || VERSION="v${VERSION}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=$VERSION"     >> "$GITHUB_OUTPUT"
           echo "Will release as: $VERSION"
 
   # ─────────────────────────────────────────
@@ -61,12 +55,14 @@ jobs:
   # ─────────────────────────────────────────
   build-frontend:
     name: Build frontend
-    needs: prepare
+    needs: sync
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
@@ -100,7 +96,7 @@ jobs:
   # ─────────────────────────────────────────
   build-backend:
     name: Build backend (${{ matrix.goos }}/${{ matrix.goarch }})
-    needs: prepare
+    needs: sync
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -125,6 +121,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -141,7 +139,7 @@ jobs:
         run: |
           mkdir -p ../dist
           go build -buildvcs=false -trimpath \
-            -ldflags="-s -w -X main.Version=${{ needs.prepare.outputs.version }}" \
+            -ldflags="-s -w -X main.Version=${{ needs.sync.outputs.version }}" \
             -o "../dist/grok2api-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}" \
             ./cmd/grok2api
 
@@ -153,12 +151,12 @@ jobs:
           retention-days: 1
 
   # ─────────────────────────────────────────
-  # 4. 打包发布产物（二进制 + 前端 dist）
+  # 4. 打包发布产物
   # ─────────────────────────────────────────
   package:
     name: Package release assets
     needs:
-      - prepare
+      - sync
       - build-frontend
       - build-backend
     runs-on: ubuntu-latest
@@ -166,6 +164,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -175,10 +175,7 @@ jobs:
       - name: Prepare release directory
         run: |
           mkdir -p release
-          VERSION="${{ needs.prepare.outputs.version }}"
-
-          cp config.example.yaml release/
-          cp VERSION release/
+          VERSION="${{ needs.sync.outputs.version }}"
 
           for dir in artifacts/backend-*/; do
             platform=$(basename "$dir" | sed 's/backend-//')
@@ -186,7 +183,7 @@ jobs:
             binary_name=$(basename "$binary_file")
             ext="${binary_name##*.}"
             [ "$ext" = "$binary_name" ] && ext="" || ext=".$ext"
-            [ "$platform" = *"windows"* ] && ext=".exe" || true
+            [[ "$platform" == *"windows"* ]] && ext=".exe" || true
 
             mkdir -p "pkg_${platform}"
             cp "${dir}${binary_name}" "pkg_${platform}/grok2api${ext}"
@@ -214,12 +211,12 @@ jobs:
           retention-days: 7
 
   # ─────────────────────────────────────────
-  # 5. 创建 GitHub Release
+  # 5. 删除旧 Release → 创建新 Release
   # ─────────────────────────────────────────
   github-release:
     name: Create GitHub Release
     needs:
-      - prepare
+      - sync
       - package
     runs-on: ubuntu-latest
     permissions:
@@ -229,6 +226,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
 
       - name: Download release assets
@@ -238,9 +236,8 @@ jobs:
           path: release/
 
       - name: Generate changelog
-        id: changelog
         run: |
-          VERSION="${{ needs.prepare.outputs.version }}"
+          VERSION="${{ needs.sync.outputs.version }}"
           PREV_TAG=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || echo "")
           if [ -n "$PREV_TAG" ]; then
             COMMITS=$(git log --oneline "${PREV_TAG}..HEAD" 2>/dev/null | head -50 || echo "")
@@ -274,21 +271,30 @@ jobs:
             echo "每个完整包包含：可执行文件、前端 dist 目录、config.example.yaml 配置示例。"
           } > changelog.md
 
-      - name: Create or update Git tag
+      - name: Delete existing release and tag (if any)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VERSION="${{ needs.prepare.outputs.version }}"
+          VERSION="${{ needs.sync.outputs.version }}"
+          if gh release view "${VERSION}" &>/dev/null; then
+            echo "Deleting existing release: ${VERSION}"
+            gh release delete "${VERSION}" --yes --cleanup-tag
+          fi
+          git push origin ":refs/tags/${VERSION}" 2>/dev/null || true
+
+      - name: Create Git tag
+        run: |
+          VERSION="${{ needs.sync.outputs.version }}"
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          if ! git ls-remote --tags origin "refs/tags/${VERSION}" | grep -q "${VERSION}"; then
-            git tag -a "${VERSION}" -m "Release ${VERSION}"
-            git push origin "${VERSION}"
-          fi
+          git tag -fa "${VERSION}" -m "Release ${VERSION}"
+          git push origin "${VERSION}" --force
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.prepare.outputs.version }}
-          name: Release ${{ needs.prepare.outputs.version }}
+          tag_name: ${{ needs.sync.outputs.version }}
+          name: Release ${{ needs.sync.outputs.version }}
           body_path: changelog.md
           draft: false
           prerelease: false
@@ -301,9 +307,9 @@ jobs:
   # 6. 构建并推送 Docker 镜像到 GHCR
   # ─────────────────────────────────────────
   docker:
-    name: Build & Push Docker image (${{ matrix.arch }})
+    name: Build & Push Docker (${{ matrix.arch }})
     needs:
-      - prepare
+      - sync
       - package
     permissions:
       contents: read
@@ -323,6 +329,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -340,7 +348,7 @@ jobs:
         with:
           images: ${{ steps.image.outputs.name }}
           tags: |
-            type=raw,value=${{ needs.prepare.outputs.version }}-${{ matrix.arch }}
+            type=raw,value=${{ needs.sync.outputs.version }}-${{ matrix.arch }}
             type=raw,value=latest-${{ matrix.arch }}
 
       - name: Login to GHCR
@@ -367,7 +375,7 @@ jobs:
   docker-merge:
     name: Merge Docker manifest
     needs:
-      - prepare
+      - sync
       - docker
     runs-on: ubuntu-latest
     permissions:
@@ -396,7 +404,7 @@ jobs:
         shell: bash
         run: |
           IMAGE="${{ steps.image.outputs.name }}"
-          VERSION="${{ needs.prepare.outputs.version }}"
+          VERSION="${{ needs.sync.outputs.version }}"
 
           docker buildx imagetools create \
             -t "${IMAGE}:${VERSION}" \
@@ -411,5 +419,5 @@ jobs:
       - name: Inspect manifest
         run: |
           IMAGE="${{ steps.image.outputs.name }}"
-          VERSION="${{ needs.prepare.outputs.version }}"
+          VERSION="${{ needs.sync.outputs.version }}"
           docker buildx imagetools inspect "${IMAGE}:${VERSION}"
